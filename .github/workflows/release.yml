@@ -152,11 +152,12 @@ jobs:
       - name: Create the release
         env:
           GH_TOKEN: ${{ github.token }}
+        # -R everywhere: this job has no git checkout of this repo, so gh cannot infer it.
         run: |
           ls -l files
-          if gh release view "$TAG" > /dev/null 2>&1; then
-            gh release upload "$TAG" files/* --clobber
-            gh release edit "$TAG" --title "$TAG" --notes-file notes.md --latest
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "$TAG" files/* --clobber -R "$GITHUB_REPOSITORY"
+            gh release edit "$TAG" --title "$TAG" --notes-file notes.md --latest -R "$GITHUB_REPOSITORY"
           else
-            gh release create "$TAG" files/* --title "$TAG" --notes-file notes.md --latest
+            gh release create "$TAG" files/* --title "$TAG" --notes-file notes.md --latest -R "$GITHUB_REPOSITORY"
           fi
