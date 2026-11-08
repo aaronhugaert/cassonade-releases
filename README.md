@@ -31,4 +31,4 @@ The app updates itself. It checks this repository's latest release, verifies the
 
 ## About this repository
 
-Releases are built here by GitHub Actions from the project's private source repository, so the build does not use private-repository minutes. The workflow is in `.github/workflows/release.yml`. The installers contain the app's bundled JavaScript, as any desktop app does; the source tree is not published.
+Releases are built here by GitHub Actions from the project's private source repository, so the build does not use private-repository minutes. The release workflow is in `.github/workflows/release.yml`; `.github/workflows/icon-check.yml` compiles and previews the macOS icon. The installers contain the app's bundled JavaScript, as any desktop app does; the source tree is not published.

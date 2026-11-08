@@ -1,7 +1,7 @@
 name: Release
 
 # Builds a Cassonade release from the PRIVATE source repo and publishes it here. The source is checked out on the runner only;
-# this repository's tree holds just a README and this file. Logs of a public repo are public, so build steps run quietly.
+# this repository's tree holds just a README and two workflows (this one and icon-check.yml). Logs of a public repo are public, so build steps run quietly.
 #
 # Triggers are deliberately only these two. No pull_request or push: the secrets below must never reach code from a fork.
 on:
@@ -65,7 +65,8 @@ jobs:
           - os: windows-latest
             target: --win
             artifact: installers-windows
-          - os: macos-latest
+          # macos-26: the macOS icon (Icon Composer .icon) needs the actool of Xcode 26+.
+          - os: macos-26
             target: --mac
             artifact: installers-macos
     runs-on: ${{ matrix.os }}
@@ -151,12 +152,11 @@ jobs:
       - name: Create the release
         env:
           GH_TOKEN: ${{ github.token }}
-        # -R everywhere: this job has no git checkout of this repo, so gh cannot infer it.
         run: |
           ls -l files
-          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
-            gh release upload "$TAG" files/* --clobber -R "$GITHUB_REPOSITORY"
-            gh release edit "$TAG" --title "$TAG" --notes-file notes.md --latest -R "$GITHUB_REPOSITORY"
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release upload "$TAG" files/* --clobber
+            gh release edit "$TAG" --title "$TAG" --notes-file notes.md --latest
           else
-            gh release create "$TAG" files/* --title "$TAG" --notes-file notes.md --latest -R "$GITHUB_REPOSITORY"
+            gh release create "$TAG" files/* --title "$TAG" --notes-file notes.md --latest
           fi

@@ -1,0 +1,122 @@
+name: Icon check
+
+# Compiles the macOS app icon (app/build/icon.icon, an Icon Composer bundle) from the PRIVATE source repo and uploads previews of it,
+# without making a release. It exists because this is the only place a macOS runner is free: the source repo has no macOS minutes.
+# Only app/build is checked out, so no source code reaches the runner or the public logs (the icon ships publicly in the app anyway).
+#
+# Trigger is deliberately only workflow_dispatch. No pull_request or push: the secret below must never reach code from a fork.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch, tag or commit of the source repo whose app/build/icon.icon to check"
+        required: true
+        type: string
+        default: main
+
+# Secrets (Settings, Secrets and variables, Actions):
+#   CASSONADE_SOURCE_TOKEN  fine-grained token, Contents read-only on aaronhugaert/cassonade
+permissions:
+  contents: read
+
+# One run per ref; a newer dispatch of the same ref replaces the older one.
+concurrency:
+  group: icon-check-${{ inputs.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  icon:
+    # actool for .icon bundles needs Xcode 26+; same label as the release build.
+    runs-on: macos-26
+    env:
+      SOURCE_REF: ${{ inputs.ref }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: aaronhugaert/cassonade
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.CASSONADE_SOURCE_TOKEN }}
+          path: src
+          persist-credentials: false
+          sparse-checkout: app/build
+      - name: Tool versions
+        run: |
+          xcrun actool --version
+          xcodebuild -version
+      # Same invocation as electron-builder. The bundle is copied to Icon.icon first: the app-icon name must match the bundle name.
+      - name: Compile the icon
+        run: |
+          set -euo pipefail
+          cp -R src/app/build/icon.icon "$RUNNER_TEMP/Icon.icon"
+          mkdir -p "$RUNNER_TEMP/out"
+          xcrun actool "$RUNNER_TEMP/Icon.icon" \
+            --compile "$RUNNER_TEMP/out" \
+            --output-format human-readable-text --notices --warnings \
+            --output-partial-info-plist "$RUNNER_TEMP/out/assetcatalog_generated_info.plist" \
+            --app-icon Icon --include-all-app-icons \
+            --accent-color AccentColor \
+            --enable-on-demand-resources NO \
+            --development-region en \
+            --target-device mac \
+            --minimum-deployment-target 26.0 \
+            --platform macosx
+          for f in Assets.car Icon.icns; do
+            if [ ! -f "$RUNNER_TEMP/out/$f" ]; then
+              echo "::error::actool did not produce $f"
+              exit 1
+            fi
+          done
+          ls -l "$RUNNER_TEMP/out"
+      - name: Render previews
+        run: |
+          set -euo pipefail
+          previews="$RUNNER_TEMP/previews"
+          mkdir -p "$previews"
+
+          # Older macOS (before 26) shows the .icns.
+          iconutil -c iconset "$RUNNER_TEMP/out/Icon.icns" -o "$previews/legacy-icns.iconset"
+
+          # macOS 26+ renders the compiled catalog; ictool (Icon Composer) draws each of its renditions.
+          ICTOOL="$(dirname "$(xcode-select -p)")/Applications/Icon Composer.app/Contents/Executables/ictool"
+          if [ ! -x "$ICTOOL" ]; then
+            echo "::warning::ictool not found at $ICTOOL; skipping the macOS 26 previews"
+            exit 0
+          fi
+          for rendition in Default Dark ClearLight ClearDark TintedLight TintedDark; do
+            if ! "$ICTOOL" "$RUNNER_TEMP/Icon.icon" --export-image \
+              --output-file "$previews/tahoe-$rendition.png" \
+              --platform macOS --rendition "$rendition" \
+              --width 512 --height 512 --scale 2; then
+              if [ "$rendition" = Default ]; then
+                echo "::error::ictool failed on the Default rendition"
+                exit 1
+              fi
+              echo "::warning::ictool failed on the $rendition rendition"
+            fi
+          done
+      - name: Summary
+        run: |
+          {
+            echo "## Icon check"
+            echo
+            echo "Ref checked: \`$SOURCE_REF\`"
+            echo
+            echo "actool: \`$(xcrun actool --version | tr '\n' ' ')\`"
+            echo
+            echo "Previews (artifact \`icon-previews\`):"
+            echo
+            (cd "$RUNNER_TEMP/previews" && find . -type f | sort | sed 's/^\.\///; s/^/- /')
+            echo "- Icon.icns"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: icon-previews
+          path: |
+            ${{ runner.temp }}/previews
+            ${{ runner.temp }}/out/Icon.icns
+          if-no-files-found: error
+          retention-days: 7
