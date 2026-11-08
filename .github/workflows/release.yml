@@ -1,0 +1,161 @@
+name: Release
+
+# Builds a Cassonade release from the PRIVATE source repo and publishes it here. The source is checked out on the runner only;
+# this repository's tree holds just a README and this file. Logs of a public repo are public, so build steps run quietly.
+#
+# Triggers are deliberately only these two. No pull_request or push: the secrets below must never reach code from a fork.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Source release tag to build, e.g. v0.3.0"
+        required: true
+        type: string
+      verbose:
+        description: "Show build output. If a step fails the log may print source code, and this repo's logs are public: leave off"
+        required: false
+        type: boolean
+        default: false
+  repository_dispatch:
+    types: [cassonade-release]
+
+# Secrets (Settings, Secrets and variables, Actions):
+#   CASSONADE_SOURCE_TOKEN  fine-grained token, Contents read-only on aaronhugaert/cassonade
+#   UPDATE_SIGNING_KEY      Ed25519 private key that signs every installer (the app embeds the public half)
+permissions:
+  contents: read
+
+# One run per tag, never cancelled: a second dispatch of the same tag waits instead of killing a half-published release.
+concurrency:
+  group: release-${{ inputs.tag || github.event.client_payload.tag }}
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPO: aaronhugaert/cassonade
+  VERBOSE: ${{ inputs.verbose && '1' || '0' }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  meta:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.v.outputs.tag }}
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - id: v
+        env:
+          INPUT_TAG: ${{ inputs.tag || github.event.client_payload.tag }}
+        run: |
+          if ! [[ "$INPUT_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::the tag must look like v1.2.3"
+            exit 1
+          fi
+          echo "tag=$INPUT_TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${INPUT_TAG#v}" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: meta
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - os: windows-latest
+            target: --win
+            artifact: installers-windows
+          - os: macos-latest
+            target: --mac
+            artifact: installers-macos
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: aaronhugaert/cassonade
+          ref: ${{ needs.meta.outputs.tag }}
+          token: ${{ secrets.CASSONADE_SOURCE_TOKEN }}
+          path: src
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: src/.nvmrc
+          cache: npm
+          cache-dependency-path: src/package-lock.json
+      # Each step's output is withheld unless VERBOSE: a failing compiler or test prints the offending source lines.
+      - name: Build
+        working-directory: src
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          quiet() {
+            if [ "$VERBOSE" = 1 ]; then "$@"; return; fi
+            "$@" > "$RUNNER_TEMP/step.log" 2>&1 || { echo "::error::'$*' failed; its output is withheld because this repository is public. Reproduce it locally, or rerun with verbose."; return 1; }
+          }
+          quiet npm ci --no-audit --no-fund
+          quiet npm run bundle
+          quiet npm run build:app
+          quiet node scripts/package.ts "$TARGET"
+          ls -l dist/installers
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            src/dist/installers/*.exe
+            src/dist/installers/*.dmg
+            src/dist/installers/*.zip
+            src/dist/installers/*.blockmap
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: [meta, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ needs.meta.outputs.tag }}
+      VERSION: ${{ needs.meta.outputs.version }}
+    steps:
+      # Only what the publish script reads: it, the feed contract, the public key, the changelog.
+      - uses: actions/checkout@v7
+        with:
+          repository: aaronhugaert/cassonade
+          ref: ${{ needs.meta.outputs.tag }}
+          token: ${{ secrets.CASSONADE_SOURCE_TOKEN }}
+          path: src
+          persist-credentials: false
+          sparse-checkout: |
+            scripts/releases
+            app/src/main/update
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: src/.nvmrc
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: installers-*
+          path: files
+          merge-multiple: true
+      # The notes people see: the source release's body (user-facing text), else the tag's CHANGELOG section.
+      - name: Release notes
+        env:
+          GH_TOKEN: ${{ secrets.CASSONADE_SOURCE_TOKEN }}
+        run: |
+          gh release view "$TAG" -R "$SOURCE_REPO" --json body --jq .body > source-notes.md 2>/dev/null || : > source-notes.md
+          gh api "repos/$SOURCE_REPO/contents/CHANGELOG.md?ref=$TAG" -H "Accept: application/vnd.github.raw" > CHANGELOG.md 2>/dev/null || : > CHANGELOG.md
+      # Signs the installers, writes latest.json and SHA256SUMS next to them. The key is in this one step's environment.
+      - name: Sign and write the feed
+        env:
+          UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+        run: node src/scripts/releases/publish-assets.ts --dir files --version "$VERSION" --notes source-notes.md --changelog CHANGELOG.md --notes-out notes.md
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ls -l files
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release upload "$TAG" files/* --clobber
+            gh release edit "$TAG" --title "$TAG" --notes-file notes.md --latest
+          else
+            gh release create "$TAG" files/* --title "$TAG" --notes-file notes.md --latest
+          fi
